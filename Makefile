@@ -31,7 +31,6 @@ DOPTS=-DNDEBUG=1 -O3
 KA9QOBJS = misc.o multicast.o rtp.o status.o decode_status.o
 
 COPTS=-march=native -std=gnu11 -pthread -Wall -funsafe-math-optimizations -D_GNU_SOURCE=1
-INCLUDES=-Ika9q-sources
 
 CFLAGS=$(DOPTS) $(COPTS)
 CPPFLAGS=$(INCLUDES)
@@ -79,6 +78,7 @@ config_paths.h: Makefile
 	@printf '#define GIT_SUMMARY "%s"\n' "$$(git log -1 --format=%s | $(esc))" >> $@
 	@printf '#define GIT_VERSION "%s"\n' "$$(git describe --always --dirty --tags | $(esc))" >> $@
 	@printf '#define GIT_REMOTE_URL "%s"\n' "$$(git remote get-url origin  | $(esc))" >> $@
+	@printf '#define GIT_COMMIT_INDEX "%s"\n' "$$(git rev-list --count HEAD | $(esc))" >> $@
 	@printf '#endif\n' >> $@
 
 %.service: %.service.in

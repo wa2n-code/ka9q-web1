@@ -398,44 +398,6 @@ static unsigned long now_ms(void) {
   return (unsigned long)(ts.tv_sec * 1000UL + ts.tv_nsec / 1000000UL);
 }
 
-/* If no build-time `GIT_COMMIT` is embedded, provide a runtime fallback that
-   reads the short commit from the local git metadata. This helper is omitted
-   when `GIT_COMMIT` is defined to avoid unused-function warnings. */
-#ifndef GIT_COMMIT
-static void log_git_commit_runtime(void) {
-  char buf[128];
-  FILE *f = popen("git rev-parse --short HEAD 2>/dev/null", "r");
-  if (f) {
-    if (fgets(buf, sizeof(buf), f)) {
-      buf[strcspn(buf, "\r\n")] = '\0';
-      syslog(LOG_INFO, "ka9q-web commit: %s", buf);
-    } else {
-      syslog(LOG_INFO, "ka9q-web commit: unknown");
-    }
-    pclose(f);
-  } else {
-    syslog(LOG_INFO, "ka9q-web commit: unknown");
-  }
-}
-#endif
-
-#ifndef GIT_COMMIT_INDEX
-static void log_git_commit_index_runtime(void) {
-  char ibuf[64];
-  FILE *f = popen("git rev-list --count HEAD 2>/dev/null", "r");
-  if (f) {
-    if (fgets(ibuf, sizeof(ibuf), f)) {
-      ibuf[strcspn(ibuf, "\r\n")] = '\0';
-      syslog(LOG_INFO, "ka9q-web commit-index: %s", ibuf);
-    } else {
-      syslog(LOG_INFO, "ka9q-web commit-index: unknown");
-    }
-    pclose(f);
-  } else {
-    syslog(LOG_INFO, "ka9q-web commit-index: unknown");
-  }
-}
-#endif
 /* Adopt-on-parameter-mismatch control removed from clients; server adoption
   decisions are now driven by backend-reported post-detection shift values. */
 /* Preset mismatch auto-acceptance removed: server will not auto-correct presets */
@@ -1053,33 +1015,11 @@ int main(int argc,char **argv) {
   /* Open syslog and record the current git commit index. Prefer the build-time
      embedded `GIT_COMMIT_INDEX` if available; otherwise fall back to runtime git. */
   openlog(App_path, LOG_PID|LOG_CONS, LOG_USER);
-#ifdef GIT_COMMIT_INDEX
   syslog(LOG_INFO, "ka9q-web commit-index: %s (build)", GIT_COMMIT_INDEX);
-#else
-  log_git_commit_index_runtime();
-#endif
 
   /* Print commit index to stdout for visibility on startup. If not embedded,
      query the local git metadata as a fallback. */
-#ifdef GIT_COMMIT_INDEX
   printf("ka9q-web commit-index: %s\n", GIT_COMMIT_INDEX);
-#else
-  {
-    char ibuf[64];
-    FILE *fidx = popen("git rev-list --count HEAD 2>/dev/null", "r");
-    if (fidx) {
-      if (fgets(ibuf, sizeof(ibuf), fidx)) {
-        ibuf[strcspn(ibuf, "\r\n")] = '\0';
-        printf("ka9q-web commit-index: %s\n", ibuf);
-      } else {
-        printf("ka9q-web commit-index: unknown\n");
-      }
-      pclose(fidx);
-    } else {
-      printf("ka9q-web commit-index: unknown\n");
-    }
-  }
-#endif
   {
     int c;
     while((c = getopt(argc,argv,"d:p:m:hn:vb:rT:")) != -1){
@@ -1237,20 +1177,8 @@ onion_connection_status version(void *data, onion_request * req,
                                           onion_response * res) {
     char text[1024];
     char idx[64] = "unknown";
-#ifdef GIT_COMMIT_INDEX
     strncpy(idx, GIT_COMMIT_INDEX, sizeof(idx)-1);
     idx[sizeof(idx)-1] = '\0';
-#else
-    {
-      FILE *f = popen("git rev-list --count HEAD 2>/dev/null", "r");
-      if (f) {
-        if (fgets(idx, sizeof(idx), f)) {
-          idx[strcspn(idx, "\r\n")] = '\0';
-        }
-        pclose(f);
-      }
-    }
-#endif
     snprintf(text, sizeof(text), "{\"Version\":\"%s (%s)\"}", webserver_version, idx);
     onion_response_write0(res, text);
     return OCS_PROCESSED;
