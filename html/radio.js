@@ -1,5 +1,5 @@
 //
-// G0ORX WebSDR using ka9q-radio uddated March 16, 2025 02:44Z WA2N WA2ZKD
+// G0ORX WebSDR using ka9q-radio — touched: 2026-05-11  (timestamp-only update)
 //
 //
 //'use strict'; kills save to local storage with Max Hold among other things
