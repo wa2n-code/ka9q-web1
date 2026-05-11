@@ -1,10 +1,18 @@
-ka9q-web (1.0-3) UNRELEASED; urgency=medium
+ka9q-web (1.0-4) ka9q; urgency=medium
+
+  * Wayne's socket timeout js code merged
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 11 May 2026 00:09:00 -0700
+
+
+ka9q-web (1.0-3) unstable; urgency=medium
 
   [ Phil Karn ]
   * Initial release. (Closes: #nnnn)  <nnnn is the bug number of your ITP>
   * Fix syntax of $SYSTEM in .service file
   * Reload systemd after installation
-  * Cleaned up GIT macro generation in Make, removed runtime generation	
+  * Cleaned up GIT macro generation in Make, removed runtime generation
   * Re-merged into upstream wa2n-code/ka9q-web1 (vs ka9q-web)
 
- -- Phil Karn <karn@ka9q.net>  Sat, 09 May 2026 19:32:41 -0700
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 11 May 2026 00:07:09 -0700
