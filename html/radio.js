@@ -1702,12 +1702,153 @@ function applyQuickBW() {
             spectrum.radio_pointer = window;
             page_title = "";
 
-            ws=new WebSocket((window.location.protocol == 'https:' ? 'wss://' : 'ws://') + window.location.host);
-            ws.onmessage=on_ws_message;
-            ws.onopen=on_ws_open;
-            ws.onclose=on_ws_close;
-            ws.binaryType = "arraybuffer";
-            ws.onerror = on_ws_error;
+            // Create websocket with reconnect support + UI popup for status/cancel
+            (function() {
+              let reconnectTimer = null;
+              let reconnectDelayMs = 1000;
+              const reconnectMaxDelayMs = 30000;
+              let reconnectCancelled = false;
+              let reconnectCountdownInterval = null;
+              let isAttemptingConnect = false;
+
+              function createReconnectPopup() {
+                if (document.getElementById('ws-reconnect-popup')) return;
+                const wrapper = document.createElement('div');
+                wrapper.id = 'ws-reconnect-popup';
+                wrapper.style.position = 'fixed';
+                wrapper.style.left = '50%';
+                wrapper.style.top = '20%';
+                wrapper.style.transform = 'translateX(-50%)';
+                wrapper.style.background = 'rgba(0,0,0,0.85)';
+                wrapper.style.color = '#fff';
+                wrapper.style.padding = '16px';
+                wrapper.style.border = '2px solid #444';
+                wrapper.style.borderRadius = '8px';
+                wrapper.style.zIndex = 9999;
+                wrapper.style.minWidth = '300px';
+                wrapper.innerHTML = '<div style="font-weight:600;margin-bottom:8px;">Connection failed — retrying</div>' +
+                  '<div id="ws-reconnect-info" style="margin-bottom:8px;">Retrying in <span id="ws-retry-seconds">0</span>s (backoff)</div>' +
+                  '<div style="text-align:right;">' +
+                    '<button id="ws-reconnect-retry" style="padding:6px 10px;margin-right:8px;">Retry Now</button>' +
+                    '<button id="ws-reconnect-cancel" style="padding:6px 10px;">Cancel</button>' +
+                  '</div>';
+                document.body.appendChild(wrapper);
+                document.getElementById('ws-reconnect-cancel').addEventListener('click', cancelReconnecting);
+                document.getElementById('ws-reconnect-retry').addEventListener('click', retryNow);
+              }
+
+              function showReconnectPopup(delayMs) {
+                try {
+                  if (reconnectCancelled) return;
+                  createReconnectPopup();
+                  // Always show the countdown message when scheduling a reconnect
+                  const infoEl = document.getElementById('ws-reconnect-info');
+                  if (infoEl) {
+                    infoEl.innerHTML = 'Retrying in <span id="ws-retry-seconds">0</span>s (backoff)';
+                  }
+                  const secondsEl = document.getElementById('ws-retry-seconds');
+                  if (!secondsEl) return;
+                  const start = Date.now();
+                  const end = start + delayMs;
+                  if (reconnectCountdownInterval) clearInterval(reconnectCountdownInterval);
+                  function update() {
+                    const rem = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+                    secondsEl.textContent = rem.toString();
+                  }
+                  update();
+                  reconnectCountdownInterval = setInterval(update, 250);
+                } catch (e) { console.warn('showReconnectPopup error', e); }
+              }
+
+              function hideReconnectPopup() {
+                try {
+                  if (reconnectCountdownInterval) { clearInterval(reconnectCountdownInterval); reconnectCountdownInterval = null; }
+                  const el = document.getElementById('ws-reconnect-popup');
+                  if (el && el.parentNode) el.parentNode.removeChild(el);
+                } catch (e) { console.warn('hideReconnectPopup error', e); }
+              }
+
+              function setPopupRetryingNow() {
+                try {
+                  if (reconnectCountdownInterval) { clearInterval(reconnectCountdownInterval); reconnectCountdownInterval = null; }
+                  const infoEl = document.getElementById('ws-reconnect-info');
+                  if (infoEl) {
+                    // Preserve the retry-seconds span so future countdowns can reuse it
+                    infoEl.innerHTML = 'Retrying now... <span id="ws-retry-seconds" style="display:none">0</span>';
+                  }
+                } catch (e) { console.warn('setPopupRetryingNow error', e); }
+              }
+
+              function cancelReconnecting() {
+                try {
+                  reconnectCancelled = true;
+                  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                  hideReconnectPopup();
+                  console.info('[radio.js] websocket reconnecting cancelled by user');
+                } catch (e) { console.warn('cancelReconnecting error', e); }
+              }
+
+              function retryNow() {
+                try {
+                  // Reset backoff to 1s for subsequent failures and attempt immediate reconnect
+                  reconnectDelayMs = 1000;
+                  reconnectCancelled = false;
+                  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                  console.info('[radio.js] websocket retry requested by user');
+                  connectWebSocket();
+                } catch (e) { console.warn('retryNow error', e); }
+              }
+
+              function scheduleReconnect() {
+                try {
+                  if (reconnectCancelled) return;
+                  if (reconnectTimer) return; // already scheduled
+                  showReconnectPopup(reconnectDelayMs);
+                  reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    if (reconnectCancelled) return;
+                    reconnectDelayMs = Math.min(reconnectDelayMs * 2, reconnectMaxDelayMs);
+                      // Actual connection attempt will update popup to 'Retrying now...'
+                      connectWebSocket();
+                  }, reconnectDelayMs);
+                  console.info('[radio.js] scheduling websocket reconnect in', reconnectDelayMs, 'ms');
+                } catch (e) { console.warn('scheduleReconnect error', e); }
+              }
+
+              function connectWebSocket() {
+                try {
+                  if (reconnectCancelled) return;
+                  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+                  // Mark that we're attempting a connection and update popup accordingly
+                  isAttemptingConnect = true;
+                  setPopupRetryingNow();
+                  ws = new WebSocket((window.location.protocol == 'https:' ? 'wss://' : 'ws://') + window.location.host);
+                  ws.onmessage = on_ws_message;
+                  ws.onopen = function(evt) {
+                    try { reconnectDelayMs = 1000; if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } } catch (e) {}
+                    try { console.info('[radio.js] WebSocket opened/reconnected; readyState=', ws && ws.readyState); } catch (e) {}
+                    try { isAttemptingConnect = false; hideReconnectPopup(); reconnectCancelled = false; } catch (e) {}
+                    try { on_ws_open(evt); } catch (e) { console.warn('on_ws_open threw', e); }
+                  };
+                  ws.onclose = function(evt) {
+                    try { on_ws_close(evt); } catch (e) { console.warn('on_ws_close threw', e); }
+                    // mark that no connection attempt is active
+                    try { isAttemptingConnect = false; } catch (e) {}
+                    // Attempt reconnect automatically
+                    if (!reconnectCancelled) scheduleReconnect();
+                  };
+                  ws.binaryType = "arraybuffer";
+                  ws.onerror = on_ws_error;
+                } catch (e) {
+                  try { isAttemptingConnect = false; } catch (err) {}
+                  console.warn('connectWebSocket failed', e);
+                  scheduleReconnect();
+                }
+              }
+
+              // Kick off initial connection
+              connectWebSocket();
+            })();
             // Attach input handlers now that DOM may be ready
             try { document.getElementById('waterfall').addEventListener("wheel", onWheel, false); } catch (e) {}
             try { document.getElementById('waterfall').addEventListener("keydown", (event) => { spectrum.onKeypress(event); }, false); } catch (e) {}
