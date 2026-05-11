@@ -1,8 +1,10 @@
-ka9q-web (1.0-2.1) UNRELEASED; urgency=medium
+ka9q-web (1.0-3) UNRELEASED; urgency=medium
 
   [ Phil Karn ]
   * Initial release. (Closes: #nnnn)  <nnnn is the bug number of your ITP>
   * Fix syntax of $SYSTEM in .service file
   * Reload systemd after installation
+  * Cleaned up GIT macro generation in Make, removed runtime generation	
+  * Re-merged into upstream wa2n-code/ka9q-web1 (vs ka9q-web)
 
- --  <karn@ka9q.net>  Wed, 06 May 2026 20:02:15 -0700
+ -- Phil Karn <karn@ka9q.net>  Sat, 09 May 2026 19:32:41 -0700
