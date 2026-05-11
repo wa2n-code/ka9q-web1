@@ -1,3 +1,9 @@
+ka9q-web (1.0-5) ka9q; urgency=medium
+
+  * reverted wayne's socket code on his advice
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 11 May 2026 01:42:48 -0700
+
 ka9q-web (1.0-4) ka9q; urgency=medium
 
   * Wayne's socket timeout js code merged
