@@ -3,7 +3,7 @@ Section: hamradio
 Priority: optional
 Maintainer: Phil Karn <karn@ka9q.net>
 Rules-Requires-Root: no
-Build-Depends: git, make, gcc debhelper-compat (= 13),
+Build-Depends: git, make, gcc, debhelper-compat (= 13),
  libonion-dev, libbsd-dev, libiniparser-dev, libopus-dev,
  libfftw3-dev
 Standards-Version: 4.7.2
