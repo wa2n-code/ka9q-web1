@@ -32,12 +32,8 @@ KA9QOBJS = misc.o multicast.o rtp.o status.o decode_status.o
 
 COPTS=-march=native -std=gnu11 -pthread -Wall -funsafe-math-optimizations -D_GNU_SOURCE=1
 
-RESOURCES_BASE_DIR=$(prefix)/share/ka9q-web
-GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || printf "unknown")
-GIT_COMMIT_INDEX := $(shell git rev-list --count HEAD 2>/dev/null || printf "unknown")
-
 CFLAGS=$(DOPTS) $(COPTS)
-CPPFLAGS=$(INCLUDES) -DRESOURCES_BASE_DIR=$(RESOURCES_BASE_DIR) -DGIT_COMMIT=\"$(GIT_COMMIT)\" -DGIT_COMMIT_INDEX=\"$(GIT_COMMIT_INDEX)\"
+CPPFLAGS=$(INCLUDES)
 
 all: ka9q-web ka9q-web.service
 
