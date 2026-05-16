@@ -36,7 +36,7 @@
 #include "misc.h"
 
 #ifndef PKGDATADIR
-#define PKGDATADIR "/usr/local/share/ka9q-radio"
+#define PKGDATADIR "/usr/local/share/ka9q-web"
 #endif
 
 #ifndef CONFDIR
