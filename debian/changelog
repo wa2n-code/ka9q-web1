@@ -1,3 +1,33 @@
+ka9q-web (1.0.2-1~noble1) noble; urgency=medium
+
+  * chage default PKGDATADIR to /usr/[local/]share/ka9q-web in misc.c borrowed from ka9q-radio
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 12:43:25 -0700
+
+ka9q-web (1.0.1-1~noble1) noble; urgency=medium
+
+  * Upstream update from wa2n
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 12:14:58 -0700
+
+ka9q-web (1.0-8~noble1) noble; urgency=medium
+
+  * bump version
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 00:15:59 -0700
+
+ka9q-web (1.0-7~noble1) noble; urgency=medium
+
+  * correct changelog to noble, amd64
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 00:08:10 -0700
+
+ka9q-web (1.0-7~trixie2) trixie; urgency=medium
+
+  * Fixes to wayne's /usr/share/ka9q-web/html construction
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 00:04:40 -0700
+
 ka9q-web (1.0-6~trixie1) trixie; urgency=medium
 
   * Merged Wayne's upstream
