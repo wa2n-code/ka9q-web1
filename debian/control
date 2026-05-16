@@ -3,8 +3,9 @@ Section: hamradio
 Priority: optional
 Maintainer: Phil Karn <karn@ka9q.net>
 Rules-Requires-Root: no
-Build-Depends:
- debhelper-compat (= 13),
+Build-Depends: git, make, gcc, debhelper-compat (= 13),
+ libonion-dev, libbsd-dev, libiniparser-dev, libopus-dev,
+ libfftw3-dev
 Standards-Version: 4.7.2
 Homepage: http://www.ka9q.net
 #Vcs-Browser: https://salsa.debian.org/debian/ka9q-web
