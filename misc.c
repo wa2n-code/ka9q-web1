@@ -34,7 +34,6 @@
 #endif
 
 #include "misc.h"
-#include "config_paths.h"
 
 #ifndef PKGDATADIR
 #define PKGDATADIR "/usr/local/share/ka9q-radio"
