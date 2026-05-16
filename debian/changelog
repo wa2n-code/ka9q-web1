@@ -1,3 +1,9 @@
+ka9q-web (1.0-6~trixie1) trixie; urgency=medium
+
+  * Merged Wayne's upstream
+
+ -- Phil Karn <karn@ka9q.net>  Fri, 15 May 2026 23:33:09 -0700
+
 ka9q-web (1.0-5) ka9q; urgency=medium
 
   * reverted wayne's socket code on his advice

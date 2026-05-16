@@ -54,7 +54,7 @@ install-config:
 	install -b -m 644 config/* $(DESTDIR)$(confdir)
 
 clean:
-	-rm -f ka9q-web *.o *.d config_paths.h ka9q-web.service
+	-rm -f ka9q-web *.o *.d config_paths.h ka9q-web.service libka9q.a
 
 .PHONY: clean all install
 
