@@ -41,6 +41,9 @@
 #include <sys/time.h>
 #include <syslog.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "misc.h"
 #include "multicast.h"
@@ -48,11 +51,49 @@
 #include "radio.h"
 #include "config.h"
 
-#ifndef PKGDATADIR
-#define PKGDATADIR  /usr/local/share/ka9q-web
+#ifndef RESOURCES_BASE_DIR
+#define RESOURCES_BASE_DIR /usr/local/share/ka9q-web
 #endif
 
+/* Maximum number of concurrent websocket client sessions. Set conservatively. */
+#define MAX_SESSIONS 5
+
+/*
+  Notes on recent changes (also applied to ka9q-web1/ka9q-web.c):
+
+  - Enforce a conservative maximum concurrent websocket sessions via
+    `MAX_SESSIONS`. When the server reaches capacity we now attach a
+    reject callback that attempts to send a short text frame of the form
+    "BUSY: <message>" and then closes the connection. This avoids creating
+    a full session when resources are exhausted.
+
+  - The rejection path (`reject_ws_cb`) writes a BUSY text frame and
+    briefly sleeps (50 ms) to improve the chance the frame is flushed
+    before closing. Sending a text frame then closing a websocket can be
+    racey in some browser/network stacks; therefore the client-side
+    JavaScript was also updated to detect "BUSY:" messages and, as a
+    fallback, detect repeated short-lived open/close cycles and present a
+    modal instead of continuously reconnecting.
+
+  - Changes were mirrored in the `ka9q-web1` tree to keep behavior
+    consistent across deployments. Only this file (`ka9q-web.c`) is
+    documented/committed here; the `ka9q-web1` edits exist in the
+    workspace but were intentionally not pushed in this commit.
+
+  - Rationale: rejecting at the websocket handling point avoids creating
+    writer threads and per-session resources for clients that cannot be
+    serviced. A future improvement would be to reject at HTTP upgrade
+    time with a 503/429 response to avoid the websocket upgrade/close
+    race entirely.
+*/
+
 const char *webserver_version = "2.83";
+
+/* Set to 1 to avoid performing hostname lookups for incoming clients.
+  When enabled the server will record numeric IP addresses instead of
+  using libonion's client description (which may perform reverse DNS).
+  Toggle this constant in source to change behavior. */
+const int NO_HOSTNAMES = 1;
 
 
 // no handlers in /usr/local/include??
@@ -140,7 +181,7 @@ struct session {
   /* uint32_t last_poll_tag; */
 };
 
-#define START_SESSION_ID 1000
+#define START_SESSION_ID 1000000
 
 int init_connections(const char *multicast_group);
 extern int init_control(struct session *sp);
@@ -164,6 +205,16 @@ void *ctrl_thread(void *arg);
 static void send_ws_binary_to_session(struct session *sp, uint8_t *buf, int size);
 static void send_ws_text_to_session(struct session *sp, const char *msg);
 static void *ws_ping_thread(void *arg);
+/* Reject-callback for new websockets when the server is at capacity. */
+static onion_connection_status reject_ws_cb(void *data, onion_websocket *ws, long int unused) {
+  (void)unused;
+  const char *msg = "BUSY: server at capacity; try again later";
+  onion_websocket_set_opcode(ws, OWS_TEXT);
+  onion_websocket_write(ws, msg, strlen(msg));
+  /* allow a short time for the frame to flush to the socket before closing */
+  usleep(50000); /* 50 ms */
+  return OCS_CLOSE_CONNECTION;
+}
 /* Outgoing message node for per-session queue */
 struct ws_msg {
   uint8_t *data;
@@ -190,6 +241,40 @@ static int get_request_fd(void *req) {
       return -1;
   }
   return fn(req);
+}
+
+/* Helper: obtain a short client description. When `NO_HOSTNAMES` is set
+   prefer a numeric IP string (avoids reverse DNS lookups). Returns a
+   pointer to `buf` when a numeric address is produced, otherwise falls
+   back to libonion's `onion_request_get_client_description()` result. */
+static const char *client_desc_from_request(void *req, char *buf, size_t buflen) {
+  if (!NO_HOSTNAMES) {
+    return onion_request_get_client_description((onion_request*)req);
+  }
+  int fd = get_request_fd(req);
+  if (fd >= 0) {
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) == 0) {
+      if (addr.ss_family == AF_INET) {
+        struct sockaddr_in *a = (struct sockaddr_in *)&addr;
+        if (inet_ntop(AF_INET, &a->sin_addr, buf, buflen)) {
+          return buf;
+        }
+      } else if (addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addr;
+        if (inet_ntop(AF_INET6, &a6->sin6_addr, buf, buflen)) {
+          return buf;
+        }
+      }
+    }
+  }
+  /* Fallback to libonion description if numeric form unavailable */
+  const char *desc = onion_request_get_client_description((onion_request*)req);
+  if (desc && desc[0] != '\0') return desc;
+  strncpy(buf, "unknown", buflen);
+  buf[buflen-1] = '\0';
+  return buf;
 }
 /* Tentative declarations so watchdog can reference them before the real defs */
 static int nsessions;
@@ -252,7 +337,12 @@ static void *ws_watchdog_thread(void *arg) {
                with session list operations. We intentionally avoid locking
                sp->ws_mutex here to prevent deadlock against the blocked writer. */
             pthread_mutex_lock(&session_mutex);
-            control_set_frequency(sp, "0");
+            /* Avoid forcing backend to tune to 0 on transient watchdog recovery.
+              Telling backend frequency=0 causes global BFREQ=0 notifications
+              which can break other active clients. Just clean the session
+              locally and remove it; backend tuning should be handled at a
+              higher level if desired. */
+            // control_set_frequency(sp, "0");
             sp->audio_active = false;
             if (sp->spectrum_active) {
               pthread_mutex_lock(&sp->spectrum_mutex);
@@ -780,8 +870,11 @@ void websocket_closed(struct session *sp) {
   if (verbose)
     fprintf(stderr,"%s(): SSRC=%d audio_active=%d spectrum_active=%d\n",__FUNCTION__,sp->ssrc,sp->audio_active,sp->spectrum_active);
   pthread_t spectrum_join = 0;
-  pthread_mutex_lock(&sp->ws_mutex);
-  control_set_frequency(sp,"0");
+    pthread_mutex_lock(&sp->ws_mutex);
+    /* Do not command the backend to tune to 0 when a websocket closes.
+      This can result in BFREQ:0.000 being sent to other clients and
+      cause audio to disappear. */
+    // control_set_frequency(sp,"0");
   sp->audio_active=false;
   if(sp->spectrum_active) {
     pthread_mutex_lock(&sp->spectrum_mutex);
@@ -1023,7 +1116,7 @@ int main(int argc,char **argv) {
 #define xstr(s) str(s)
 #define str(s) #s
   char const *port="8081";
-  char const *dirname=PKGDATADIR "/html";
+  char const *dirname=xstr(RESOURCES_BASE_DIR) "/html";
   char const *mcast="hf.local";
   App_path=argv[0];
   /* Open syslog and record the current git commit index. Prefer the build-time
@@ -1305,7 +1398,9 @@ onion_connection_status home(void *data, onion_request * req,
   onion_websocket *ws = onion_websocket_new(req, res);
   //fprintf(stderr,"%s: ws=%p\n",__FUNCTION__,ws);
   if(ws==NULL) {
-    fprintf(stderr, "%s: HTTP request (no websocket upgrade) from %s - serving redirect\n", __FUNCTION__, onion_request_get_client_description(req));
+    char _cdesc[128];
+    const char *_c = client_desc_from_request(req, _cdesc, sizeof(_cdesc));
+    fprintf(stderr, "%s: HTTP request (no websocket upgrade) from %s - serving redirect\n", __FUNCTION__, _c);
     onion_response_write0(res,
       "<!DOCTYPE html>"
       "<html>"
@@ -1320,8 +1415,20 @@ onion_connection_status home(void *data, onion_request * req,
     return OCS_PROCESSED;
   }
 
+  /* Enforce server-wide concurrent websocket limit. If at capacity,
+     attach a short-lived reject callback that sends a BUSY message. */
+  pthread_mutex_lock(&session_mutex);
+  if (nsessions >= MAX_SESSIONS) {
+    pthread_mutex_unlock(&session_mutex);
+    fprintf(stderr, "home: rejecting websocket — max clients %d reached\n", MAX_SESSIONS);
+    onion_websocket_set_callback(ws, reject_ws_cb);
+    return OCS_WEBSOCKET;
+  }
+  pthread_mutex_unlock(&session_mutex);
+
   // create session (or attempt to reattach to an existing one for this client)
-  const char *client_desc = onion_request_get_client_description(req);
+  char client_desc_buf[128];
+  const char *client_desc = client_desc_from_request(req, client_desc_buf, sizeof(client_desc_buf));
   // Try to find an existing session with the same client description and attach to it.
   pthread_mutex_lock(&session_mutex);
   struct session *existing = sessions;
@@ -1331,9 +1438,28 @@ onion_connection_status home(void *data, onion_request * req,
          new websocket from the same IP/host (e.g. a second browser tab)
          from clobbering an active session and stealing its SSRC. */
       if (existing->ws != NULL) {
-        /* Active session already present for this client description; skip reattach. */
-        existing = existing->next;
-        continue;
+        /* Only skip reattach if the previous websocket is genuinely active.
+           A non-NULL `ws` is not enough — when a client browser closes its
+           WS the server may not yet have noticed (the ws pointer remains
+           until a write fails or the watchdog cleans it). For tunnel/frpc
+           clients all sharing client_desc=127.0.0.1, blindly skipping when
+           ws!=NULL prevents a reconnecting client from ever reattaching.
+           Treat the session as active only if it had recent (within
+           REATTACH_GRACE_MS) client activity or server writes; otherwise
+           treat as stale and fall through to reattach. */
+        const unsigned long REATTACH_GRACE_MS = 2000;
+        unsigned long now = now_ms();
+        unsigned long recent = 0;
+        if (existing->last_client_command_ms > recent) recent = existing->last_client_command_ms;
+        if (existing->last_write_start_ms > recent && existing->last_write_start_ms <= now) recent = existing->last_write_start_ms;
+        if (recent > 0 && now > recent && (now - recent) < REATTACH_GRACE_MS) {
+          /* Recent activity — legitimate active session (e.g. second tab). Skip. */
+          existing = existing->next;
+          continue;
+        }
+        fprintf(stderr, "%s: reattach over stale ws=%p for client=%s ssrc=%u (no activity for %lums)\n",
+                __FUNCTION__, (void *)existing->ws, existing->client, existing->ssrc,
+                (now > recent) ? (now - recent) : 0UL);
       }
       /* Reattach websocket to existing session to preserve SSRC and state */
       existing->ws = ws;
@@ -2869,7 +2995,9 @@ static void *session_writer_thread(void *arg)
       if (pres <= 0) {
         /* timeout or error: consider write stuck and clean session */
         fprintf(stderr, "%s: poll timeout/error (%d) on ssrc=%u, cleaning session\n", __FUNCTION__, pres, sp->ssrc);
-        control_set_frequency(sp, "0");
+        /* Do not tell the backend to tune to 0 here; that causes other
+           clients to receive BFREQ=0 and lose audio. */
+        // control_set_frequency(sp, "0");
         sp->audio_active = false;
         pthread_t spectrum_join = 0;
         if (sp->spectrum_active) {
@@ -2897,8 +3025,9 @@ static void *session_writer_thread(void *arg)
     sp->write_in_progress = false;
     if (r <= 0) {
       fprintf(stderr, "%s: onion_websocket_write returned %d for ssrc=%u, cleaning session\n", __FUNCTION__, r, sp->ssrc);
-      /* On failure, perform cleanup similar to prior helpers. */
-      control_set_frequency(sp, "0");
+      /* On failure, perform cleanup similar to prior helpers. Avoid sending
+         RADIO_FREQUENCY=0 which affects global backend state. */
+      // control_set_frequency(sp, "0");
       sp->audio_active = false;
       pthread_t spectrum_join = 0;
       if (sp->spectrum_active) {
