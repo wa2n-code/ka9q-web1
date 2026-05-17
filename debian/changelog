@@ -1,3 +1,16 @@
+ka9q-web (1.0.3-1~trixie1) trixie; urgency=medium
+
+  * Wayne's 5/17 patches from upstream
+  * reintegrate construction of PKGDATADIR + /html
+
+ -- Phil Karn <karn@ka9q.net>  Sun, 17 May 2026 10:41:28 -0700
+
+ka9q-web (1.0.2-1~trixie1) trixie; urgency=medium
+
+  * trixie amd64
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 12:47:48 -0700
+
 ka9q-web (1.0.2-1~noble1) noble; urgency=medium
 
   * chage default PKGDATADIR to /usr/[local/]share/ka9q-web in misc.c borrowed from ka9q-radio
