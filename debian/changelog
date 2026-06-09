@@ -1,3 +1,9 @@
+ka9q-web (1.0.5~trixie1) trixie; urgency=medium
+
+  * Merge wayne's upstream
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 08 Jun 2026 19:24:03 -0700
+
 ka9q-web (1.0.4~trixie1) trixie; urgency=medium
 
   * merge wayne's upstream
