@@ -34,9 +34,7 @@ ARCHOPTS = -march=native
 endif
 
 KA9QOBJS = misc.o multicast.o rtp.o status.o decode_status.o
-
-COPTS=-march=native -std=gnu11 -pthread -Wall -funsafe-math-optimizations -D_GNU_SOURCE=1
-
+COPTS=-std=gnu11 -pthread -Wall -funsafe-math-optimizations
 CFLAGS=$(DOPTS) $(COPTS)
 CPPFLAGS=$(INCLUDES)
 
