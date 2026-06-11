@@ -1,3 +1,11 @@
+ka9q-web (2026.06.10-1-trixie1) trixie; urgency=medium
+
+  * switch to date-based numbering
+  * add BUILD=debug option
+  * don't build with march=native, use 'make NATIVE=1'
+
+ -- Phil Karn <karn@ka9q.net>  Wed, 10 Jun 2026 16:54:41 -0700
+
 ka9q-web (1.0.5~trixie1) trixie; urgency=medium
 
   * Merge wayne's upstream
