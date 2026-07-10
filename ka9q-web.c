@@ -111,6 +111,7 @@ pthread_t ctrl_task;
 pthread_t audio_task;
 pthread_t ws_ping_task;
 pthread_t ws_watchdog_task;
+pthread_t lifetime_refresh_task;
 /* monitor removed: previously guarded by ENABLE_MONITOR */
 pthread_mutex_t output_dest_socket_mutex;
 pthread_cond_t output_dest_socket_cond;
@@ -198,9 +199,12 @@ extern void control_set_window_type(struct session *sp, char *type_str, char *sh
 extern void control_set_encoding(struct session *sp, bool use_opus);
 int init_demod(struct channel *channel);
 void control_get_powers(struct session *sp,float frequency,int bins,float bin_bw);
+/* New: request powers with explicit demod type (fallback to SPECT2_DEMOD if needed) */
+void control_get_powers_with_demod(struct session *sp,float frequency,int bins,float bin_bw,int demod_type);
 void stop_spectrum_stream(struct session *sp);
 int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *bin_bw,int32_t const ssrc,uint8_t const * const buffer,int length,struct session *sp);
 void control_poll(struct session *sp);
+static void *lifetime_refresh_thread(void *arg);
 void *spectrum_thread(void *arg);
 void *ctrl_thread(void *arg);
 
@@ -279,6 +283,201 @@ static const char *client_desc_from_request(void *req, char *buf, size_t buflen)
   buf[buflen-1] = '\0';
   return buf;
 }
+/* ---- BEGIN IN-PROCESS BLACKLIST ---- */
+struct blacklist_entry {
+  int family;             /* AF_INET or AF_INET6 */
+  uint8_t addr[16];
+  unsigned prefix_len;    /* 32 for IPv4 exact, 128 for IPv6 exact, or CIDR */
+  char text[128];
+  struct blacklist_entry *next;
+};
+
+static struct blacklist_entry *blacklist_head = NULL;
+
+static void __attribute__((unused)) free_blacklist(void) {
+  struct blacklist_entry *e = blacklist_head;
+  while (e) {
+    struct blacklist_entry *n = e->next;
+    free(e);
+    e = n;
+  }
+  blacklist_head = NULL;
+}
+
+static int parse_and_add_cidr(const char *s) {
+  char buf[128];
+  if (!s || !*s) return -1;
+  strncpy(buf, s, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
+  /* trim leading whitespace */
+  char *p = buf;
+  while (*p && isspace((unsigned char)*p)) p++;
+  char *eol = strchr(p, '\n'); if (eol) *eol = '\0';
+  /* skip comments/empty */
+  if (*p == '\0' || *p == '#') return -1;
+
+  char *slash = strchr(p, '/');
+  char ipstr[64];
+  unsigned prefix = 0;
+  if (slash) {
+    *slash = '\0';
+    strncpy(ipstr, p, sizeof(ipstr)-1); ipstr[sizeof(ipstr)-1] = '\0';
+    prefix = (unsigned)atoi(slash + 1);
+  } else {
+    strncpy(ipstr, p, sizeof(ipstr)-1); ipstr[sizeof(ipstr)-1] = '\0';
+  }
+
+  struct in_addr in4;
+  struct in6_addr in6;
+  struct blacklist_entry *entry = calloc(1, sizeof(*entry));
+  if (!entry) return -1;
+
+  if (inet_pton(AF_INET, ipstr, &in4) == 1) {
+    entry->family = AF_INET;
+    memset(entry->addr, 0, 12);
+    /* copy network-order address into last 4 bytes */
+    memcpy(entry->addr + 12, &in4.s_addr, 4);
+    /* Add 96 to place the comparison at byte offset 12 in addr_matches_prefix.
+       Without this, prefix_len=32 compares only the first 4 bytes (all zeros),
+       which incorrectly matches every IPv4 address. */
+    entry->prefix_len = (slash ? prefix : 32) + 96;
+  } else if (inet_pton(AF_INET6, ipstr, &in6) == 1) {
+    entry->family = AF_INET6;
+    memcpy(entry->addr, in6.s6_addr, 16);
+    entry->prefix_len = (slash ? prefix : 128);
+  } else {
+    free(entry);
+    return -1;
+  }
+  strlcpy(entry->text, p, sizeof(entry->text));
+  entry->next = blacklist_head;
+  blacklist_head = entry;
+  return 0;
+}
+
+static int load_blacklist_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  char line[256];
+  int loaded = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '\0') continue;
+    if (line[0] == '#') continue;
+    if (parse_and_add_cidr(line) == 0) {
+      /* print to stdout as requested (trim trailing newline) */
+      char t[256];
+      strlcpy(t, line, sizeof(t));
+      t[strcspn(t, "\r\n")] = '\0';
+      printf("Blacklisted: %s\n", t);
+      loaded++;
+    }
+  }
+  fclose(f);
+  return loaded;
+}
+
+/* helper: masked compare of two 16-byte addresses with prefix */
+static int addr_matches_prefix(const uint8_t *addr, const uint8_t *net, unsigned prefix) {
+  unsigned full = prefix / 8;
+  unsigned rem = prefix % 8;
+  if (full > 16) full = 16;
+  if (full > 0) {
+    if (memcmp(addr, net, full) != 0) return 0;
+  }
+  if (rem && full < 16) {
+    uint8_t mask = (uint8_t)(0xff << (8 - rem));
+    if ((addr[full] & mask) != (net[full] & mask)) return 0;
+  }
+  return 1;
+}
+
+/* check sockaddr against blacklist */
+static int sockaddr_is_blacklisted(const struct sockaddr *sa) {
+  if (!sa || !blacklist_head) return 0;
+  if (sa->sa_family == AF_INET) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+    uint8_t addr[16] = {0};
+    memcpy(addr + 12, &sin->sin_addr.s_addr, 4);
+    for (struct blacklist_entry *e = blacklist_head; e; e = e->next) {
+      if (e->family != AF_INET) continue;
+      if (addr_matches_prefix(addr, e->addr, e->prefix_len)) return 1;
+    }
+  } else if (sa->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+    const uint8_t *raw = sin6->sin6_addr.s6_addr;
+    /* Detect IPv4-mapped IPv6 address (::ffff:x.x.x.x):
+       bytes 0-9 are 0, bytes 10-11 are 0xff. This happens when the server
+       listens on '::' (dual-stack) and an IPv4 client connects. */
+    static const uint8_t v4mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    if (memcmp(raw, v4mapped, 12) == 0) {
+      uint8_t addr4[16] = {0};
+      memcpy(addr4 + 12, raw + 12, 4);
+      for (struct blacklist_entry *e = blacklist_head; e; e = e->next) {
+        if (e->family != AF_INET) continue;
+        if (addr_matches_prefix(addr4, e->addr, e->prefix_len)) return 1;
+      }
+    }
+    /* Also check native IPv6 entries */
+    uint8_t addr6[16];
+    memcpy(addr6, raw, 16);
+    for (struct blacklist_entry *e = blacklist_head; e; e = e->next) {
+      if (e->family != AF_INET6) continue;
+      if (addr_matches_prefix(addr6, e->addr, e->prefix_len)) return 1;
+    }
+  }
+  return 0;
+}
+
+/* uses existing get_request_fd(req) helper to get peer sockaddr and test it */
+static int is_request_blacklisted(void *req) {
+  int fd = get_request_fd(req);
+  if (fd >= 0) {
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) == 0) {
+      return sockaddr_is_blacklisted((struct sockaddr *)&addr);
+    }
+  }
+  /* Fallback: try textual client description (numeric IP form) */
+  char descbuf[128];
+  const char *desc = client_desc_from_request(req, descbuf, sizeof(descbuf));
+  if (desc && desc[0]) {
+    struct in_addr in4;
+    struct in6_addr in6;
+    if (inet_pton(AF_INET, desc, &in4) == 1) {
+      struct sockaddr_in sin;
+      memset(&sin, 0, sizeof(sin));
+      sin.sin_family = AF_INET;
+      sin.sin_addr = in4;
+      return sockaddr_is_blacklisted((struct sockaddr *)&sin);
+    } else if (inet_pton(AF_INET6, desc, &in6) == 1) {
+      struct sockaddr_in6 sin6;
+      memset(&sin6, 0, sizeof(sin6));
+      sin6.sin6_family = AF_INET6;
+      sin6.sin6_addr = in6;
+      return sockaddr_is_blacklisted((struct sockaddr *)&sin6);
+    }
+  }
+  return 0;
+}
+/* Global delegate for blacklist wrapper (set in main) */
+/* Global blacklist wrapper handler (file-scope). Delegates to the handler
+   supplied in `data` when the peer is not blacklisted. */
+static onion_connection_status blacklist_wrap(void *data, onion_request *req, onion_response *res) {
+  onion_handler *delegate = (onion_handler *)data;
+  if (is_request_blacklisted(req)) {
+    char _c[128];
+    const char *_cd = client_desc_from_request(req, _c, sizeof(_c));
+    fprintf(stderr, "blacklist: rejecting %s\n", _cd);
+    onion_response_set_code(res, 403);
+    onion_response_write0(res, "Forbidden\n");
+    return OCS_PROCESSED;
+  }
+  if (delegate) {
+    return onion_handler_handle(delegate, req, res);
+  }
+  return OCS_NOT_PROCESSED;
+}
+/* ---- END IN-PROCESS BLACKLIST ---- */
 /* Tentative declarations so watchdog can reference them before the real defs */
 static int nsessions;
 static struct session *sessions;
@@ -478,6 +677,8 @@ static void check_frequency(struct session *sp);
 static void zoom_to(struct session *sp, int level);
 static void zoom(struct session *sp, int shift);
 static void adjust_center_within_bounds(struct session *sp);
+static uint32_t allocate_session_ssrc(void);
+static bool session_pair_in_use(uint32_t ssrc);
 /* Define zoom_table type and table so handler can compute size */
 struct zoom_table_t {
   int bin_width;
@@ -523,13 +724,41 @@ static onion_connection_status handle_ws_message(struct session *sp, char *tmp) 
       case 'S':
       case 's':
         {
+          // Allow an optional parameter: S:STOP to pause spectrum, or S: / S to resume/start.
+          char *param = strtok_r(NULL, ":", &saveptr);
+
+          if (param && strcasecmp(param, "STOP") == 0) {
+            // Client requested spectrum pause: echo SSRC and ask backend to stop spectrum stream for this SSRC
+            char temp_stop[16];
+            snprintf(temp_stop, sizeof(temp_stop), "S:%d", sp->ssrc);
+            send_ws_text_to_session(sp, temp_stop);
+            sp->spectrum_requested_by_client = false;
+            sp->spectrum_restart_attempts = 0;
+            sp->last_spectrum_restart_ms = 0;
+            sp->spectrum_active = false;
+            stop_spectrum_stream(sp);
+            if (verbose) fprintf(stderr, "SSRC %u: spectrum stop requested by client\n", sp->ssrc);
+            break;
+          }
+
+          // Plain S: or S without STOP -> start/resume spectrum for this session
           char temp[16];
           snprintf(temp, sizeof(temp), "S:%d", sp->ssrc);
           send_ws_text_to_session(sp, temp);
           if (debugSSRC) fprintf(stderr, "ws: S: request from ssrc %u\n", sp->ssrc);
+
+          /* Avoid duplicate starts only when a spectrum thread is actually active.
+             `spectrum_requested_by_client` can be stale after reconnects; in that case
+             allow S: to restart so users do not need a stop/start double-toggle. */
+          if (sp->spectrum_active) {
+            if (verbose) fprintf(stderr, "SSRC %u: spectrum already active, ignoring start\n", sp->ssrc);
+            break;
+          }
+
           sp->spectrum_requested_by_client = true;
           sp->spectrum_restart_attempts = 0;
           sp->last_spectrum_restart_ms = 0;
+          sp->spectrum_active = true;
           if(pthread_create(&sp->spectrum_task,NULL,spectrum_thread,sp) == -1){
             perror("pthread_create: spectrum_thread");
           } else {
@@ -991,6 +1220,30 @@ static void adjust_center_within_bounds(struct session *sp) {
   sp->center_frequency = (uint32_t)center_freq;
 }
 
+static bool session_pair_in_use(uint32_t ssrc) {
+  struct session *sp = sessions;
+  while (sp != NULL) {
+    if (sp->ssrc == ssrc || sp->ssrc == ssrc + 1 || (sp->ssrc + 1) == ssrc) {
+      return true;
+    }
+    sp = sp->next;
+  }
+  return false;
+}
+
+static uint32_t allocate_session_ssrc(void) {
+  uint32_t candidate;
+
+  do {
+    candidate = arc4random();
+    candidate &= 0x7ffffffeU; /* force even and keep it in the positive 31-bit range */
+    if (candidate == 0)
+      candidate = START_SESSION_ID;
+  } while (session_pair_in_use(candidate));
+
+  return candidate;
+}
+
 /* websocket ping thread: iterate sessions and send short text PINGs */
 static void *ws_ping_thread(void *arg) {
   (void)arg;
@@ -1234,6 +1487,8 @@ int main(int argc,char **argv) {
     fprintf(stderr, "Failed to initialize multicast connections; exiting\n");
     return EX_IOERR;
   }
+  /* Load in-process blacklist from /etc/radio/web-blacklist (prints entries to stdout) */
+  load_blacklist_file("/etc/radio/web-blacklist");
   /* Send default spectrum averaging to backend at startup (default 10) */
   control_set_spectrum_average(NULL, "10");
     /* Do not send a default spectrum overlap at startup; prefer client-provided value.
@@ -1243,7 +1498,15 @@ int main(int argc,char **argv) {
   onion_set_port(o, port);
   onion_set_hostname(o, "::");
   onion_handler *pages = onion_handler_export_local_new(dirname);
-  onion_handler_add(onion_url_to_handler(urls), pages);
+    /* Create a wrapper handler that enforces the blacklist and delegates to
+      the `pages` handler. Insert it at the top-level so all requests are
+      checked before being served. */
+        onion_handler *blacklist_handler = onion_handler_new(blacklist_wrap, pages, NULL);
+        /* Insert the blacklist handler into the URL handler chain and attach the
+          `pages` handler as its child so the blacklist check runs before static
+          file handling. */
+        onion_handler_add(onion_url_to_handler(urls), blacklist_handler);
+        onion_handler_add(blacklist_handler, pages);
   onion_url_add(urls, "status", status);
   onion_url_add(urls, "version.json", version);
   onion_url_add(urls, "^$", home);
@@ -1512,7 +1775,6 @@ onion_connection_status home(void *data, onion_request * req,
   }
   pthread_mutex_unlock(&session_mutex);
 
-  int i;
   struct session *sp=calloc(1,sizeof(*sp));
   /*
    * SSRC allocation convention:
@@ -1523,18 +1785,7 @@ onion_connection_status home(void *data, onion_request * req,
    *    browser can correctly associate spectrum frames when multiple
    *    sessions/clients are active.
    */
-  if(nsessions==0) {
-    sp->ssrc=START_SESSION_ID;
-  } else {
-    for(i=0;i<nsessions;i++) {
-      struct session *s=find_session_from_ssrc(START_SESSION_ID+(i*2));
-      if(s==NULL) {
-        break;
-      }
-      pthread_mutex_unlock(&session_mutex);
-    }
-    sp->ssrc=START_SESSION_ID+(i*2);
-  }
+  sp->ssrc = allocate_session_ssrc();
   sp->ws=ws;
   /* Try to set the underlying websocket socket to non-blocking so slow
      clients do not block server threads. As with the reattach path above,
@@ -1858,6 +2109,14 @@ int init_connections(const char *multicast_group) {
     char buff[16];
     snprintf(buff,16,"audio");
     pthread_setname_np(audio_task,buff);
+  }
+  /* Start lifetime refresh thread to keep channels alive while spectrum paused */
+  if(pthread_create(&lifetime_refresh_task, NULL, lifetime_refresh_thread, NULL) == -1) {
+    perror("pthread_create: lifetime_refresh_thread");
+  } else {
+    char buff2[32];
+    snprintf(buff2, sizeof(buff2), "lifetime_refresh");
+    pthread_setname_np(lifetime_refresh_task, buff2);
   }
   /* monitor thread will be started on first client connect to avoid startup noise */
   return(EX_OK);
@@ -2266,24 +2525,21 @@ void control_set_encoding(struct session *sp, bool use_opus) {
 void stop_spectrum_stream(struct session *sp) {
   uint8_t cmdbuffer[PKTSIZE];
   uint8_t *bp = cmdbuffer;
-  *bp++ = CMD; // Command
+  *bp++ = CMD;
   encode_int(&bp,OUTPUT_SSRC,sp->ssrc+1);
+  encode_int(&bp,LIFETIME,DEFAULT_CHANNEL_LIFETIME);
   uint32_t tag = random();
   encode_int(&bp,COMMAND_TAG,tag);
   encode_int(&bp,DEMOD_TYPE,SPECT2_DEMOD);
+  encode_int(&bp,BIN_COUNT,sp->bins);
+  encode_float(&bp,RESOLUTION_BW,(float)sp->bin_width);
   encode_double(&bp,RADIO_FREQUENCY,0);
   encode_eol(&bp);
   int const command_len = bp - cmdbuffer;
-  for(int i = 0; i < 3; ++i) {
-    if (verbose)
-      fprintf(stderr,"%s(): Tune 0 Hz with tag 0x%08x to close spec demod thread on SSRC %u\n",__FUNCTION__,tag,sp->ssrc+1);
-    pthread_mutex_lock(&ctl_mutex);
-    if(send(Ctl_fd,cmdbuffer,command_len,0) != command_len) {
-      perror("command send: Spectrum");
-    }
-    pthread_mutex_unlock(&ctl_mutex);
-    usleep(spectrum_poll_us);
-  }
+  pthread_mutex_lock(&ctl_mutex);
+  if(send(Ctl_fd,cmdbuffer,command_len,0) != command_len)
+    perror("command send: Spectrum stop");
+  pthread_mutex_unlock(&ctl_mutex);
 }
 
 /*
@@ -2309,13 +2565,33 @@ unlocked, allowing other threads to use the control socket. This approach ensure
 safely and reliably in a concurrent, networked environment.
 */
 void control_get_powers(struct session *sp,float frequency,int bins,float bin_bw) {
+  /* Avoid sending a spectrum request with frequency == 0. A 0 Hz tune
+     is interpreted by the backend as a command to close the spectrum
+     demod thread; that can race with startup and leave the spectrum
+     channel permanently closed. If `frequency` is zero, prefer the
+     session's `center_frequency` when available; otherwise skip.
+  */
+  if (frequency <= 0.0) {
+    if (sp && sp->center_frequency != 0) {
+      frequency = (double)sp->center_frequency;
+      if (verbose) fprintf(stderr, "control_get_powers: adjusted zero freq -> center_frequency=%u for ssrc=%u\n", sp->center_frequency, sp->ssrc+1);
+    } else {
+      if (verbose) fprintf(stderr, "control_get_powers: skipping zero-frequency spectrum request for ssrc=%u\n", sp ? sp->ssrc+1 : 0);
+      return;
+    }
+  }
+  control_get_powers_with_demod(sp,frequency,bins,bin_bw,SPECT2_DEMOD);
+}
+
+void control_get_powers_with_demod(struct session *sp,float frequency,int bins,float bin_bw,int demod_type){
   uint8_t cmdbuffer[PKTSIZE];
   uint8_t *bp = cmdbuffer;
   *bp++ = CMD; // Command
   encode_int(&bp,OUTPUT_SSRC,sp->ssrc+1);
+  encode_int(&bp,LIFETIME,DEFAULT_CHANNEL_LIFETIME); /* keep spectrum channel alive */
   uint32_t tag = random();
   encode_int(&bp,COMMAND_TAG,tag);
-  encode_int(&bp,DEMOD_TYPE,SPECT2_DEMOD);
+  encode_int(&bp,DEMOD_TYPE,demod_type);
   encode_double(&bp,RADIO_FREQUENCY,frequency);
   encode_int(&bp,BIN_COUNT,bins);
   encode_float(&bp,RESOLUTION_BW,bin_bw);
@@ -2349,14 +2625,14 @@ If the number of bytes sent does not match the expected command length, an error
 Finally, the mutex is unlocked, allowing other threads to use the control socket. This approach ensures that polling
 commands are sent safely and reliably in a concurrent, networked environment.
 */
-void control_poll(struct session *sp) {
+static void control_poll_ssrc(uint32_t ssrc) {
   static int poll_count = 0;
   uint8_t cmdbuffer[128];
   uint8_t *bp = cmdbuffer;
   *bp++ = 1; // Command
 
   /* sp->last_poll_tag = random(); */
-  encode_int(&bp,OUTPUT_SSRC,sp->ssrc); // poll specific SSRC, or request ssrc list with ssrc = 0
+  encode_int(&bp,OUTPUT_SSRC,ssrc); // poll specific SSRC, or request ssrc list with ssrc = 0
   encode_int(&bp,COMMAND_TAG,random());
   /* encode_int(&bp,COMMAND_TAG,sp->last_poll_tag); */
   encode_eol(&bp);
@@ -2373,11 +2649,102 @@ void control_poll(struct session *sp) {
       poll_start_ms = now_ms();
     }
     unsigned long elapsed_ms = poll_start_ms ? (now_ms() - poll_start_ms) : 0UL;
-    if (verbose && debug_send && debug_send_poll) fprintf(stderr, "%s: +%lums: sending poll #%d for ssrc=%u\n", __FUNCTION__, elapsed_ms, poll_count, (unsigned)sp->ssrc);
+    if (verbose && debug_send && debug_send_poll) fprintf(stderr, "%s: +%lums: sending poll #%d for ssrc=%u\n", __FUNCTION__, elapsed_ms, poll_count, (unsigned)ssrc);
     usleep(CONTROL_USLEEP_US);
     if (verbose && debug_send && debug_send_poll) fprintf(stderr, "%s: +%lums: send OK (poll #%d)\n", __FUNCTION__, elapsed_ms, poll_count);
   }
   pthread_mutex_unlock(&ctl_mutex);
+}
+
+void control_poll(struct session *sp) {
+  if (sp == NULL) return;
+  control_poll_ssrc(sp->ssrc);
+}
+
+/* Refresh channel lifetime for a session without changing other params.
+   Sends a CMD with OUTPUT_SSRC and LIFETIME so radiod keeps the channel alive. */
+static void control_refresh_lifetime_ssrc(uint32_t ssrc) {
+  uint8_t cmdbuffer[PKTSIZE];
+  uint8_t *bp = cmdbuffer;
+  *bp++ = CMD; // Command
+  encode_int(&bp, OUTPUT_SSRC, ssrc);
+  encode_int(&bp, LIFETIME, DEFAULT_CHANNEL_LIFETIME);
+  encode_int(&bp, COMMAND_TAG, arc4random());
+  encode_eol(&bp);
+  int const command_len = bp - cmdbuffer;
+  pthread_mutex_lock(&ctl_mutex);
+  if (send(Ctl_fd, cmdbuffer, command_len, 0) != command_len) {
+    perror("command send: RefreshLifetime");
+  } else {
+    if (verbose && debug_send) fprintf(stderr, "%s: refreshed lifetime for ssrc=%u\n", __FUNCTION__, ssrc);
+    usleep(CONTROL_USLEEP_US);
+  }
+  pthread_mutex_unlock(&ctl_mutex);
+}
+
+void control_refresh_lifetime(struct session *sp) {
+  if (sp == NULL) return;
+  control_refresh_lifetime_ssrc(sp->ssrc);
+}
+
+/* Thread: periodically refresh lifetimes for all sessions so radiod does not remove channels
+   while the client is paused or otherwise not sending frequent control commands. */
+static void *lifetime_refresh_thread(void *arg) {
+  (void)arg;
+  /* DEFAULT_CHANNEL_LIFETIME is expressed in backend ticks (~20 ms each).
+     Convert to milliseconds and use half-life as refresh interval. */
+  const unsigned refresh_interval_ms = (unsigned)(DEFAULT_CHANNEL_LIFETIME * 20UL / 2UL);
+  const useconds_t loop_sleep_us = 1000000; /* 1s cadence */
+  unsigned elapsed_ms = 0;
+  for (;;) {
+    uint32_t ssrcs[MAX_SESSIONS];
+    int nssrc = 0;
+    usleep(loop_sleep_us);
+    pthread_mutex_lock(&session_mutex);
+    struct session *sp = sessions;
+    while (sp != NULL) {
+      // Snapshot SSRCs for active websocket sessions; do control sends after unlocking session_mutex.
+      if (sp->ws != NULL && nssrc < MAX_SESSIONS) {
+        ssrcs[nssrc++] = sp->ssrc;
+      }
+      sp = sp->next;
+    }
+    pthread_mutex_unlock(&session_mutex);
+
+    for (int i = 0; i < nssrc; i++) {
+      /* Keep status flowing even when spectrum thread is paused/stopped so UI
+         informational fields (A/D, N0, RX rate, uptime, etc) continue to update. */
+      control_poll_ssrc(ssrcs[i]);
+      if (elapsed_ms >= refresh_interval_ms) {
+        /* Also refresh spectrum SSRC lifetime when client has requested spectrum.
+           This keeps the +1 channel from expiring during long-running sessions. */
+        pthread_mutex_lock(&session_mutex);
+        struct session *s = sessions;
+        bool refresh_spectrum = false;
+        while (s != NULL) {
+          if (s->ssrc == ssrcs[i]) {
+            refresh_spectrum = s->spectrum_requested_by_client;
+            break;
+          }
+          s = s->next;
+        }
+        pthread_mutex_unlock(&session_mutex);
+        if (refresh_spectrum) {
+          control_refresh_lifetime_ssrc(ssrcs[i] + 1);
+        }
+      }
+      if (elapsed_ms >= refresh_interval_ms) {
+        control_refresh_lifetime_ssrc(ssrcs[i]);
+      }
+    }
+
+    if (elapsed_ms >= refresh_interval_ms) {
+      elapsed_ms = 0;
+    } else {
+      elapsed_ms += 1000;
+    }
+  }
+  return NULL;
 }
 
 /* Forward declarations for helpers used by extract_powers (definitions follow below) */
@@ -2680,7 +3047,7 @@ void *spectrum_thread(void *arg) {
   struct session *sp = (struct session *)arg;
   while(sp->spectrum_active) {
     pthread_mutex_lock(&sp->spectrum_mutex);
-    control_get_powers(sp,(float)sp->center_frequency,sp->bins,(float)sp->bin_width);
+    control_get_powers_with_demod(sp,(float)sp->center_frequency,sp->bins,(float)sp->bin_width, SPECT2_DEMOD);
     pthread_mutex_unlock(&sp->spectrum_mutex);
     control_poll(sp);
     if(usleep(sp->spectrum_poll_us) != 0) {
@@ -2804,7 +3171,7 @@ void *ctrl_thread(void *arg)
     ssize_t rx_length = recv_status_packet(buffer, sizeof(buffer), &ssrc);
     if (rx_length <= 2)
       continue;
-    if (debugSSRC)
+    if (verbose)
       fprintf(stderr, "ctrl_thread: recv_status_packet len=%zd ssrc=%u\n", rx_length, ssrc);
 
     if (ssrc % 2 == 1) { /* spectrum */
@@ -3131,6 +3498,8 @@ static void process_spectrum_packet(struct session *sp, uint8_t *buffer, int rx_
 
   /* Update status values early (keeps some fields fresh) */
   decode_radio_status(&Frontend, &Channel, buffer + 1, rx_length - 1);
+  /* Record that we received a spectrum TLV for this session */
+  sp->last_spectrum_recv_ms = now_ms();
 
   memset(&rtp, 0, sizeof(rtp));
   rtp.type = 0x7F; /* spectrum data */
@@ -3161,16 +3530,63 @@ static void process_spectrum_packet(struct session *sp, uint8_t *buffer, int rx_
   *(float *)ip++ = (float)power2dB(Frontend.if_power);
   *(float *)ip++ = (float)sp->noise_density_audio;
   *ip++ = (uint32_t)sp->zoom_index;
-  *(float *)ip++ = (float)Channel.spectrum.base;
-  *(float *)ip++ = (float)Channel.spectrum.step;
+  /* Use radiod's init_chan defaults if no SPECT2 packet has arrived yet (step==0).
+     This makes placeholder frames visible even before the first real spectrum response. */
+  float const spec_base = (Channel.spectrum.step != 0.0) ? (float)Channel.spectrum.base : -150.0f;
+  float const spec_step = (Channel.spectrum.step != 0.0) ? (float)Channel.spectrum.step :   0.5f;
+  *(float *)ip++ = spec_base;
+  *(float *)ip++ = spec_step;
 
   int header_size = (uint8_t *)ip - &output_buffer[0];
   int length = (PKTSIZE - header_size) / sizeof(float);
 
-  int npower = extract_powers(powers, length, &time, &r_freq, &r_bin_bw,
-                              sp->ssrc + 1, buffer + 1, rx_length - 1, sp);
-  if (npower < 0)
-    return;
+  /* Scan TLVs to find demod type and bin data presence before attempting decode */
+  uint8_t const *scan = buffer + 1;
+  uint8_t const *end = buffer + rx_length;
+  int found_demod = -1;
+  int found_bin_byte_len = 0;
+  int found_bin_data_len = 0;
+  while (scan < end) {
+    uint8_t t = *scan++;
+    if (t == EOL) break;
+    if (scan >= end) break;
+    unsigned int optlen = *scan++;
+    if (optlen & 0x80) {
+      int length_of_length = optlen & 0x7f;
+      optlen = 0;
+      while (length_of_length > 0 && scan < end) {
+        optlen <<= 8;
+        optlen |= *scan++;
+        length_of_length--;
+      }
+    }
+    if (t == DEMOD_TYPE && scan + optlen <= end) {
+      found_demod = decode_int(scan, optlen);
+    } else if (t == BIN_BYTE_DATA) {
+      found_bin_byte_len = optlen;
+    } else if (t == BIN_DATA) {
+      found_bin_data_len = optlen;
+    }
+    scan += optlen;
+  }
+
+  int npower = -1;
+  if ((found_demod == SPECT_DEMOD || found_demod == SPECT2_DEMOD) && (found_bin_byte_len > 0 || found_bin_data_len > 0)) {
+    npower = extract_powers(powers, length, &time, &r_freq, &r_bin_bw,
+                            sp->ssrc + 1, buffer + 1, rx_length - 1, sp);
+  }
+
+  if (npower < 0) {
+    /* Synthesize a placeholder spectrum to keep the UI painting. Use last-known bin count
+       or session `sp->bins`, but limit to `length` (space available in packet). */
+    int use_bins = sp->bins > 0 ? sp->bins : (int)length;
+    if (use_bins > length) use_bins = length;
+    if (use_bins <= 0) return; /* nothing we can do */
+    /* fill with mid-gray (128) so browser paints a neutral spectrum */
+    for (int i = 0; i < use_bins; ++i) powers[i] = 128.0f;
+    npower = use_bins;
+    /* don't overwrite last_spectrum_recv_ms; leave it as-is for diagnostics */
+  }
 
   uint8_t *fp = (uint8_t *)ip;
   for (int i = 0; i < npower; i++) {
@@ -3477,6 +3893,19 @@ static void process_status_packet(struct session *sp, uint8_t *buffer, int rx_le
     else
       encode_string(&bp, DESCRIPTION, Frontend.description, strlen(Frontend.description));
   }
+  /* Include frontend/channel metadata so client status fields remain current when spectrum is paused */
+  encode_int32(&bp, INPUT_SAMPRATE, (uint32_t)round(fabs(Frontend.samprate)));
+  encode_int64(&bp, INPUT_SAMPLES, (uint64_t)Frontend.samples);
+  encode_int64(&bp, GPS_TIME, (uint64_t)Channel.clocktime);
+  encode_float(&bp, IF_POWER, power2dB(Frontend.if_power));
+  encode_float(&bp, NOISE_DENSITY, sp->noise_density_audio);
+  encode_int64(&bp, AD_OVER, (uint64_t)Frontend.overranges);
+  encode_int64(&bp, SAMPLES_SINCE_OVER, (uint64_t)Frontend.samp_since_over);
+  encode_float(&bp, RF_ATTEN, Frontend.rf_atten);
+  encode_float(&bp, RF_GAIN, Frontend.rf_gain);
+  encode_bool(&bp, RF_AGC, (bool)Frontend.rf_agc);
+  encode_float(&bp, RF_LEVEL_CAL, Frontend.rf_level_cal);
+  encode_float(&bp, NOISE_BW, Channel.spectrum.noise_bw);
   int size = (uint8_t *)bp - output_buffer;
   send_ws_binary_to_session(sp, output_buffer, size);
 }
