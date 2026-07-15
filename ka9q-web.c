@@ -90,7 +90,7 @@
     race entirely.
 */
 
-const char *webserver_version = "2.84";
+const char *webserver_version = "2.85";
 
 /* Set to 1 to avoid performing hostname lookups for incoming clients.
   When enabled the server will record numeric IP addresses instead of
@@ -1546,6 +1546,14 @@ that the displayed information accurately reflects the server’s real-time stat
 */
 onion_connection_status status(void *data, onion_request * req,
                                           onion_response * res) {
+    if (is_request_blacklisted(req)) {
+      char _c[128];
+      const char *_cd = client_desc_from_request(req, _c, sizeof(_c));
+      fprintf(stderr, "blacklist: rejecting %s\n", _cd);
+      onion_response_set_code(res, 403);
+      onion_response_write0(res, "Forbidden\n");
+      return OCS_PROCESSED;
+    }
     char text[1024];
     onion_response_write0(res,
       "<!DOCTYPE html>"
@@ -1619,6 +1627,14 @@ onion_connection_status status(void *data, onion_request * req,
 
 onion_connection_status version(void *data, onion_request * req,
                                           onion_response * res) {
+    if (is_request_blacklisted(req)) {
+      char _c[128];
+      const char *_cd = client_desc_from_request(req, _c, sizeof(_c));
+      fprintf(stderr, "blacklist: rejecting %s\n", _cd);
+      onion_response_set_code(res, 403);
+      onion_response_write0(res, "Forbidden\n");
+      return OCS_PROCESSED;
+    }
     char text[1024];
     char idx[64] = "unknown";
 #ifdef GIT_COMMIT_INDEX
@@ -1661,6 +1677,14 @@ with the web interface.
 */
 onion_connection_status home(void *data, onion_request * req,
                                           onion_response * res) {
+  if (is_request_blacklisted(req)) {
+    char _c[128];
+    const char *_cd = client_desc_from_request(req, _c, sizeof(_c));
+    fprintf(stderr, "blacklist: rejecting %s\n", _cd);
+    onion_response_set_code(res, 403);
+    onion_response_write0(res, "Forbidden\n");
+    return OCS_PROCESSED;
+  }
   onion_websocket *ws = onion_websocket_new(req, res);
   //fprintf(stderr,"%s: ws=%p\n",__FUNCTION__,ws);
   if(ws==NULL) {
@@ -3886,6 +3910,9 @@ static void process_status_packet(struct session *sp, uint8_t *buffer, int rx_le
   encode_float(&bp, BASEBAND_POWER, Channel.sig.bb_power);
   encode_float(&bp, LOW_EDGE, Channel.filter.min_IF);
   encode_float(&bp, HIGH_EDGE, Channel.filter.max_IF);
+  encode_int(&bp, OUTPUT_SAMPRATE, Channel.output.samprate);
+  encode_int(&bp, OUTPUT_CHANNELS, Channel.output.channels);
+  encode_int(&bp, OUTPUT_ENCODING, Channel.output.encoding);
   if (!sp->once) {
     sp->once = true;
     if (description_override)
