@@ -34,7 +34,7 @@ ARCHOPTS = -march=native
 endif
 
 KA9QOBJS = misc.o multicast.o rtp.o status.o decode_status.o
-COPTS=-std=gnu11 -pthread -Wall -funsafe-math-optimizations
+COPTS=-std=gnu11 -pthread -Wall -funsafe-math-optimizations -Wfloat-conversion
 CFLAGS=$(DOPTS) $(COPTS)
 CPPFLAGS=$(INCLUDES)
 
@@ -55,6 +55,9 @@ install: ka9q-web ka9q-web.service
 
 install-config:
 	install -b -m 644 config/* $(DESTDIR)$(confdir)
+
+uninstall:
+	rm -rf $(DESTDIR)$(sbindir)/ka9q-web $(DESTDIR)$(pkgdatadir) $(DESTDIR)$(systemdunitdir)/ka9q-web.service
 
 clean:
 	-rm -f ka9q-web *.o *.d config_paths.h ka9q-web.service libka9q.a
