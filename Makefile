@@ -56,6 +56,9 @@ install: ka9q-web ka9q-web.service
 install-config:
 	install -b -m 644 config/* $(DESTDIR)$(confdir)
 
+uninstall:
+	rm -rf $(DESTDIR)$(sbindir)/ka9q-web $(DESTDIR)$(pkgdatadir) $(DESTDIR)$(systemdunitdir)/ka9q-web.service
+
 clean:
 	-rm -f ka9q-web *.o *.d config_paths.h ka9q-web.service libka9q.a
 
