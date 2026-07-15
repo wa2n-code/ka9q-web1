@@ -403,9 +403,67 @@
         });
       try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
 
+      // Backend-reported PCM metadata. Prefer these values over GUI mode guesses.
+      let backendOutputSampleRate = null;
+      let backendOutputChannels = null;
+      let backendOutputEncoding = null;
+      let backendOutputMetadataSeen = false;
+
+      function getModeBasedPcmConfig() {
+        let modeEl = document.getElementById('mode');
+        let currentMode = modeEl ? (modeEl.value || '').toLowerCase() : 'am';
+        return {
+          sampleRate: (currentMode === 'fm') ? 24000 : 12000,
+          channels: (currentMode === 'iq') ? 2 : 1
+        };
+      }
+
+      function getPcmPlaybackConfig() {
+        if (backendOutputMetadataSeen &&
+            Number.isFinite(backendOutputSampleRate) && backendOutputSampleRate > 0 &&
+            Number.isFinite(backendOutputChannels) && backendOutputChannels > 0) {
+          return {
+            sampleRate: backendOutputSampleRate,
+            channels: backendOutputChannels
+          };
+        }
+        return getModeBasedPcmConfig();
+      }
+
+      function ensurePcmPlayer() {
+        const pcmCheckbox = document.getElementById('pcm_checkbox');
+        const usePcm = !!(pcmCheckbox && pcmCheckbox.checked);
+        if (!usePcm) return;
+
+        const config = getPcmPlaybackConfig();
+        const needsRecreate = (!player || !player.audioCtx || player.audioCtx.state === 'closed' ||
+          !player.option || player.option.encoding !== '16bitInt' ||
+          Number(player.option.channels) !== Number(config.channels) ||
+          Number(player.option.sampleRate) !== Number(config.sampleRate));
+
+        if (needsRecreate) {
+          try { if (player && typeof player.destroy === 'function') player.destroy(); } catch (e) {}
+          player = new PCMPlayer({
+            encoding: '16bitInt',
+            channels: config.channels,
+            sampleRate: config.sampleRate,
+            flushingTime: 250
+          });
+          try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
+          try {
+            const volumeSlider = document.getElementById('volume_control');
+            if (volumeSlider) setPlayerVolume(volumeSlider.value);
+          } catch (e) {}
+        } else if (player.audioCtx && player.audioCtx.state === 'suspended') {
+          try { player.resume(); } catch (e) {}
+        }
+      }
+
       // Opus decoder state
       let opusDecoder = null;
       let opusDecoderReady = false;
+      // Keep the user-mode USB priming workaround switchable for A/B testing.
+      const ENABLE_USERMODE_USB_PRIME = true;
 
       async function initOpusDecoder() {
         try {
@@ -673,16 +731,21 @@ function applyQuickBW() {
                 // backend audio channel follows the tuned frequency
                 try { sendControl('audio', "A:STOP:" + ssrc.toString(), 50); } catch (e) {}
                 const usePcm = document.getElementById('pcm_checkbox') && document.getElementById('pcm_checkbox').checked;
-                setTimeout(() => {
+                setTimeout(async () => {
                   try {
+                    const modeEl = document.getElementById('mode');
+                    const savedPreset = (window.localStorage) ? localStorage.getItem('preset') : null;
+                    const modeToReassert = savedPreset || (modeEl ? (modeEl.value || 'am') : 'am');
+                    await prepareAudioStartupMode(modeToReassert);
                     if (usePcm) {
                       try { sendControl('audio', "O:PCM:" + ssrc.toString(), 50); } catch (e) {}
+                      try { sendControl('audio', "A:START:" + ssrc.toString(), 50); } catch (e) {}
                     } else {
                       // ensure decoder ready then request Opus + start
                       try { initOpusDecoder(); } catch (e) {}
                       try { sendControl('audio', "O:OPUS:" + ssrc.toString(), 50); } catch (e) {}
+                      try { sendControl('audio', "A:START:" + ssrc.toString(), 50); } catch (e) {}
                     }
-                    try { sendControl('audio', "A:START:" + ssrc.toString(), 50); } catch (e) {}
                   } catch (e) {}
                 }, 150);
               }
@@ -707,10 +770,14 @@ function applyQuickBW() {
         fetchZoomTableSize(); // Fetch and store the zoom table size
         // Initialize filter edge inputs based on the target preset
         try {
-          setFilterEdgesForMode(target_preset);
+          const modeEl = document.getElementById('mode');
+          const modeForEdges = (modeEl && modeEl.value) ? modeEl.value : target_preset;
+          setFilterEdgesForMode(modeForEdges);
         } catch (e) {}
         // Attach listeners so spinner/caret presses auto-send
         try { attachEdgeInputListeners(); } catch (e) {}
+        // Push whatever edges are currently visible to backend on each open.
+        try { setTimeout(() => { try { sendFilterEdges(); } catch (e) {} }, 90); } catch (e) {}
         // If a filter-edge update was queued while WS was closed, send it now
           try {
             if (pendingFilterEdges && ws && ws.readyState === WebSocket.OPEN) {
@@ -1669,6 +1736,18 @@ function applyQuickBW() {
                     if (l >= 4) noise_bw = view.getFloat32(i, false);
                     i += l;
                     break;
+                  case 20: // OUTPUT_SAMPRATE
+                    { let _v = 0; for (let _k = 0; _k < l; _k++) _v = (_v * 256) + view.getUint8(i + _k); backendOutputSampleRate = _v; backendOutputMetadataSeen = true; }
+                    i += l;
+                    break;
+                  case 49: // OUTPUT_CHANNELS
+                    { let _v = 0; for (let _k = 0; _k < l; _k++) _v = (_v * 256) + view.getUint8(i + _k); backendOutputChannels = _v; backendOutputMetadataSeen = true; }
+                    i += l;
+                    break;
+                  case 107: // OUTPUT_ENCODING
+                    { let _v = 0; for (let _k = 0; _k < l; _k++) _v = (_v * 256) + view.getUint8(i + _k); backendOutputEncoding = _v; backendOutputMetadataSeen = true; }
+                    i += l;
+                    break;
                   default:
                     i += l; // skip unknown TLV fields
                     break;
@@ -1676,6 +1755,7 @@ function applyQuickBW() {
               }
               // Update status display from status packet (runs even when spectrum is paused)
               try { update_stats(); } catch (e) {}
+              try { ensurePcmPlayer(); } catch (e) {}
               // Ensure filter edges are numeric (avoid strings/BigInt) before applying
               try {
                 filter_low = Number(filter_low);
@@ -1718,8 +1798,20 @@ function applyQuickBW() {
                 }
               } catch (e) {}
               break;
-            case 0x7A: // 122 - 16bit PCM Audio at 12000 Hz
-              // Audio data 1 channel 12000
+            // S16BE PCM audio types from the PT table:
+            //  112 (0x70) = 48kHz mono,  113 (0x71) = 48kHz stereo
+            //  116 (0x74) = 24kHz mono,  117 (0x75) = 24kHz stereo
+            //  119 (0x77) = 16kHz mono,  120 (0x78) = 16kHz stereo
+            //  122 (0x7A) = 12kHz mono,  123 (0x7B) = 12kHz stereo  ← ISB uses 0x7B
+            //  125 (0x7D) = 8kHz mono
+            // All big-endian S16BE; player config is driven by backend metadata.
+            // Note: 0x7E (Channel Data) and 0x7F (Spectrum Data) are NOT PCM.
+            case 0x70: case 0x71:
+            case 0x74: case 0x75:
+            case 0x77: case 0x78:
+            case 0x7A: case 0x7B:
+            case 0x7D:
+              // S16BE PCM audio — any sample rate / channel count
               var dataBuffer = evt.data.slice(i,data.byteLength);
               var audio_data=new Uint8Array(dataBuffer,0,data_length);
               // byte swap
@@ -1733,24 +1825,10 @@ function applyQuickBW() {
                 // If AudioContext is missing/closed/suspended, attempt to recover automatically
                 if (!player || !player.audioCtx) {
                   try { console.warn('radio: audio pkt arrived but player/audioCtx missing — recreating player'); } catch (e) {}
-                  let modeEl = document.getElementById('mode');
-                  let currentMode = modeEl ? modeEl.value : 'am';
-                  let newSampleRate = (currentMode === 'fm') ? 24000 : 12000;
-                  let newChannels = (currentMode === 'iq') ? 2 : 1;
-                  try { if (player && typeof player.destroy === 'function') player.destroy(); } catch (e) {}
-                  player = new PCMPlayer({ encoding: '16bitInt', channels: newChannels, sampleRate: newSampleRate, flushingTime: 250 });
-                  try { const volumeSlider = document.getElementById('volume_control'); if (volumeSlider) setPlayerVolume(volumeSlider.value); } catch (e) {}
-                  try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
+                  ensurePcmPlayer();
                 } else if (player.audioCtx && player.audioCtx.state === 'closed') {
                   try { console.warn('radio: audioCtx closed — recreating player'); } catch (e) {}
-                  let modeEl = document.getElementById('mode');
-                  let currentMode = modeEl ? modeEl.value : 'am';
-                  let newSampleRate = (currentMode === 'fm') ? 24000 : 12000;
-                  let newChannels = (currentMode === 'iq') ? 2 : 1;
-                  try { player.destroy(); } catch (e) {}
-                  player = new PCMPlayer({ encoding: '16bitInt', channels: newChannels, sampleRate: newSampleRate, flushingTime: 250 });
-                  try { const volumeSlider = document.getElementById('volume_control'); if (volumeSlider) setPlayerVolume(volumeSlider.value); } catch (e) {}
-                  try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
+                  ensurePcmPlayer();
                 } else if (player.audioCtx && player.audioCtx.state === 'suspended') {
                   try { player.audioCtx.resume(); } catch (e) {}
                   // If resume does not succeed, recreate after short delay
@@ -1759,15 +1837,8 @@ function applyQuickBW() {
                       try {
                         if (!p || !p.audioCtx || (p.audioCtx && p.audioCtx.state !== 'running')) {
                           try { console.warn('radio: resume failed or still suspended — recreating player'); } catch (e) {}
-                          let modeEl = document.getElementById('mode');
-                          let currentMode = modeEl ? modeEl.value : 'am';
-                          let newSampleRate = (currentMode === 'fm') ? 24000 : 12000;
-                          let newChannels = (currentMode === 'iq') ? 2 : 1;
-                          try { if (p && typeof p.destroy === 'function') p.destroy(); } catch (e) {}
-                          p = new PCMPlayer({ encoding: '16bitInt', channels: newChannels, sampleRate: newSampleRate, flushingTime: 250 });
-                          try { const volumeSlider = document.getElementById('volume_control'); if (volumeSlider) setPlayerVolume(volumeSlider.value); } catch (e) {}
-                          try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
-                          player = p;
+                          ensurePcmPlayer();
+                          p = player;
                         }
                       } catch (ee) {}
                     }, 200);
@@ -1784,14 +1855,24 @@ function applyQuickBW() {
                   var opusPayload = new Uint8Array(evt.data, i, data_length);
                   var result = opusDecoder.decodeFrame(opusPayload);
                   if (result && result.samplesDecoded > 0) {
+                    const decodedChannels = (result.channelData && result.channelData.length) ? result.channelData.length : 1;
+                    const decodedSamples = result.samplesDecoded;
+                    const interleaved = new Float32Array(decodedSamples * decodedChannels);
+                    for (let sampleIndex = 0; sampleIndex < decodedSamples; sampleIndex++) {
+                      for (let channelIndex = 0; channelIndex < decodedChannels; channelIndex++) {
+                        const channel = result.channelData[channelIndex];
+                        interleaved[(sampleIndex * decodedChannels) + channelIndex] = channel ? channel[sampleIndex] : 0;
+                      }
+                    }
                     // Switch player to Float32 at 48 kHz on first Opus packet
                     if (!player || !player.audioCtx ||
                         player.option.encoding !== '32bitFloat' ||
-                        player.option.sampleRate !== result.sampleRate) {
+                        player.option.sampleRate !== result.sampleRate ||
+                        Number(player.option.channels) !== Number(decodedChannels)) {
                       try { if (player) player.destroy(); } catch(e) {}
                       player = new PCMPlayer({
                         encoding: '32bitFloat',
-                        channels: 1,
+                        channels: decodedChannels,
                         sampleRate: result.sampleRate,
                         flushingTime: 250
                       });
@@ -1802,7 +1883,7 @@ function applyQuickBW() {
                       } catch(e) {}
                     }
                     // Clone to ensure the Float32Array owns its buffer
-                    player.feed(new Float32Array(result.channelData[0]));
+                    player.feed(interleaved);
                   }
                 } catch(e) {
                   console.warn('Opus decode error:', e);
@@ -2772,37 +2853,8 @@ function applyQuickBW() {
         console.debug('[radio.js] setMode suppressed send; forceSend=', forceSend, 'suppressProgrammaticUI=', suppressProgrammaticUI);
       }
       
-      // Determine the new sample rate and number of channels based on the mode
-      let newSampleRate = 12000;
-      let newChannels = 1;
-
-      if (selected_mode === "iq") {
-          newChannels = 2; // Stereo for IQ mode
-      } else {
-          newChannels = 1; // Mono for other modes
-      }
-
-      if (selected_mode === "fm") {
-          newSampleRate = 24000; // Higher sample rate for FM mode
-      } else {
-          newSampleRate = 12000; // Default sample rate for other modes
-      }
-
-      // Reinitialize the PCMPlayer with the new configuration
-      player.destroy(); // Destroy the existing player instance
-      player = new PCMPlayer({
-          encoding: '16bitInt',
-          channels: newChannels,
-          sampleRate: newSampleRate,
-          flushingTime: 250
-      });
-        try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
-      // Set the player volume to match the slider after reinitializing
-      const volumeSlider = document.getElementById('volume_control');
-      if (volumeSlider) {
-          setPlayerVolume(volumeSlider.value);
-      }
-      //console.log("setMode() selected_mode=", selected_mode, " newSampleRate=", newSampleRate, " newChannels=", newChannels);
+        // Reconfigure PCM playback from backend metadata when PCM is selected.
+        try { ensurePcmPlayer(); } catch (e) {}
       saveSettings();
   // Update filter edge inputs to sensible defaults for this mode
   setFilterEdgesForMode(selected_mode);
@@ -2840,6 +2892,7 @@ function applyQuickBW() {
           break;
         case 'am':
         case 'sam':
+        case 'isb':
           lowEl.value = -5000;
           highEl.value = 5000;
           break;
@@ -3137,6 +3190,7 @@ function applyQuickBW() {
           if (btn && btn.value === "STOP") {
             sendControl('audio', "O:PCM:" + ssrc.toString(), 50);
           }
+          try { ensurePcmPlayer(); } catch (e) {}
         } else {
           initOpusDecoder();
           // If audio is running, switch to Opus immediately
@@ -3147,50 +3201,60 @@ function applyQuickBW() {
         }
     }
 
+    async function prepareAudioStartupMode(modeToReassert) {
+        const mode = (modeToReassert || 'am').toLowerCase();
+        try { sendControl('mode', 'M:' + mode, undefined, true); } catch (e) {}
+        // User presets occasionally need a sideband transition to fully initialize
+        // decoder/audio routing in the backend after cold start.
+        if (ENABLE_USERMODE_USB_PRIME && (mode === 'isb' || mode === 'user1' || mode === 'user2' || mode === 'user3')) {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          try { sendControl('mode', 'M:usb', undefined, true); } catch (e) {}
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          try { sendControl('mode', 'M:' + mode, undefined, true); } catch (e) {}
+        }
+        await new Promise((resolve) => setTimeout(resolve, 220));
+        // Re-send current frequency and filter edges after final mode set.
+        try {
+          const freqEl = document.getElementById('freq');
+          const freqVal = (freqEl && freqEl.value) ? parseFloat(freqEl.value) : (target_frequency/1000.0);
+          if (!isNaN(freqVal)) sendControl('freq', 'F:' + Number(freqVal).toFixed(3), undefined, true);
+        } catch (e) {}
+        try { sendFilterEdges(); } catch (e) {}
+        await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+
     async function audio_start_stop()
     {
         var btn = document.getElementById("audio_button");
         if(btn.value==="START") {
           btn.value = "STOP";
           btn.innerHTML = "Stop Audio";
+          const modeEl = document.getElementById('mode');
+          const savedPreset = (window.localStorage) ? localStorage.getItem('preset') : null;
+          const modeToReassert = savedPreset || (modeEl ? (modeEl.value || 'am') : 'am');
+          try {
+            if (savedPreset && modeEl && modeEl.value !== savedPreset) modeEl.value = savedPreset;
+          } catch (e) {}
+          await prepareAudioStartupMode(modeToReassert);
           const usePcm = document.getElementById('pcm_checkbox') &&
                          document.getElementById('pcm_checkbox').checked;
           if (usePcm) {
             destroyOpusDecoder();
             sendControl('audio', "O:PCM:" + ssrc.toString(), 50);
+            try { ensurePcmPlayer(); } catch (e) {}
+            sendControl('audio', "A:START:"+ssrc.toString(), 50);
           } else {
             await initOpusDecoder();
             sendControl('audio', "O:OPUS:" + ssrc.toString(), 50);
+            sendControl('audio', "A:START:"+ssrc.toString(), 50);
           }
-          sendControl('audio', "A:START:"+ssrc.toString(), 50);
           // If player or its AudioContext is gone, recreate it using current mode
           try {
-            let modeEl = document.getElementById('mode');
-            let currentMode = modeEl ? modeEl.value : 'am';
-            let newSampleRate = (currentMode === 'fm') ? 24000 : 12000;
-            let newChannels = (currentMode === 'iq') ? 2 : 1;
             if (usePcm) {
-              // If the existing player is configured for Opus (32bitFloat)
-              // or has different channels/sampleRate, recreate it for 16-bit PCM.
-              const needRecreate = (!player || !player.audioCtx) ||
-                                   (player && player.option && player.option.encoding !== '16bitInt') ||
-                                   (player && player.option && Number(player.option.channels) !== Number(newChannels)) ||
-                                   (player && player.option && Number(player.option.sampleRate) !== Number(newSampleRate));
-              if (needRecreate) {
-                try { if (player && typeof player.destroy === 'function') player.destroy(); } catch (e) {}
-                player = new PCMPlayer({
-                  encoding: '16bitInt',
-                  channels: newChannels,
-                  sampleRate: newSampleRate,
-                  flushingTime: 250
-                });
-                try { if (typeof applySavedPanner === 'function') applySavedPanner(); } catch (e) {}
-              } else {
-                try { player.resume(); } catch (e) {
-                  try { player.destroy(); } catch (ee) {}
-                  player = new PCMPlayer({ encoding: '16bitInt', channels: newChannels, sampleRate: newSampleRate, flushingTime: 250 });
-                }
-              }
+              // PCM playback is configured from backend metadata; do not guess
+              // the channel layout from the GUI mode here, because user1/ISB
+              // needs the backend-reported stereo configuration.
+              try { ensurePcmPlayer(); } catch (e) {}
             }
             // diagnostics disabled
           } catch (e) {}

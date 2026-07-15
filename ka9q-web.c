@@ -90,7 +90,7 @@
     race entirely.
 */
 
-const char *webserver_version = "2.84";
+const char *webserver_version = "2.85";
 
 /* Set to 1 to avoid performing hostname lookups for incoming clients.
   When enabled the server will record numeric IP addresses instead of
@@ -3910,6 +3910,9 @@ static void process_status_packet(struct session *sp, uint8_t *buffer, int rx_le
   encode_float(&bp, BASEBAND_POWER, Channel.sig.bb_power);
   encode_float(&bp, LOW_EDGE, Channel.filter.min_IF);
   encode_float(&bp, HIGH_EDGE, Channel.filter.max_IF);
+  encode_int(&bp, OUTPUT_SAMPRATE, Channel.output.samprate);
+  encode_int(&bp, OUTPUT_CHANNELS, Channel.output.channels);
+  encode_int(&bp, OUTPUT_ENCODING, Channel.output.encoding);
   if (!sp->once) {
     sp->once = true;
     if (description_override)
