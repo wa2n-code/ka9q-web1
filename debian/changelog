@@ -1,3 +1,10 @@
+ka9q-web (2026.07.15-2-trixie1) trixie; urgency=medium
+
+  * round sample rates when converting to integer
+  * change some scalar floats to doubles
+
+ -- Phil Karn <karn@ka9q.net>  Wed, 15 Jul 2026 16:31:55 -0700
+
 ka9q-web (2026.07.15-1-trixie1) trixie; urgency=medium
 
   * pull wayne's upstream, add 'make uninstall' target
