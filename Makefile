@@ -3,6 +3,7 @@
 .DEFAULT_GOAL := all
 
 BUILD 	      ?= release
+NATIVE        ?= 0
 prefix        ?= /usr/local
 exec_prefix   ?= $(prefix)
 bindir        ?= $(exec_prefix)/bin
@@ -22,16 +23,18 @@ UNAME_S := $(shell uname -s)
 export prefix exec_prefix bindir sbindir libdir datadir sysconfdir
 export localstatedir pkgdatadir pkglibdir statedir mandir systemdunitdir
 
-# for production
-DOPTS=-DNDEBUG=1 -O3
+ifeq ($(BUILD),debug)
+     DOPTS = -g
+else
+     DOPTS = -DNDEBUG=1 -O3
+endif
 
-# for debugging
-#DOPTS=-g
+ifeq ($(NATIVE),1)
+ARCHOPTS = -march=native
+endif
 
 KA9QOBJS = misc.o multicast.o rtp.o status.o decode_status.o
-
-COPTS=-march=native -std=gnu11 -pthread -Wall -funsafe-math-optimizations -D_GNU_SOURCE=1
-
+COPTS=-std=gnu11 -pthread -Wall -funsafe-math-optimizations -Wfloat-conversion
 CFLAGS=$(DOPTS) $(COPTS)
 CPPFLAGS=$(INCLUDES)
 
@@ -52,6 +55,9 @@ install: ka9q-web ka9q-web.service
 
 install-config:
 	install -b -m 644 config/* $(DESTDIR)$(confdir)
+
+uninstall:
+	rm -rf $(DESTDIR)$(sbindir)/ka9q-web $(DESTDIR)$(pkgdatadir) $(DESTDIR)$(systemdunitdir)/ka9q-web.service
 
 clean:
 	-rm -f ka9q-web *.o *.d config_paths.h ka9q-web.service libka9q.a

@@ -1,3 +1,67 @@
+ka9q-web (2026.07.15-2-trixie1) trixie; urgency=medium
+
+  * round sample rates when converting to integer
+  * change some scalar floats to doubles
+
+ -- Phil Karn <karn@ka9q.net>  Wed, 15 Jul 2026 16:31:55 -0700
+
+ka9q-web (2026.07.15-1-trixie1) trixie; urgency=medium
+
+  * pull wayne's upstream, add 'make uninstall' target
+
+ -- Phil Karn <karn@ka9q.net>  Tue, 14 Jul 2026 22:24:08 -0700
+
+ka9q-web (2026.07.10-1-trixie1) trixie; urgency=medium
+
+  * merge wayne's upstream - blacklist, etc
+
+ -- Phil Karn <karn@ka9q.net>  Thu, 09 Jul 2026 18:54:03 -0700
+
+ka9q-web (2026.06.24-2-trixie1) trixie; urgency=medium
+
+  * Waynes 2.84 - use lifetime parameter to clear stale radiod sessions
+
+ -- Phil Karn <karn@ka9q.net>  Wed, 24 Jun 2026 07:21:52 -0700
+
+ka9q-web (2026.06.24-1-trixie1) trixie; urgency=medium
+
+  * Merge Wayne's upstream, removing CHU :-(
+
+ -- Phil Karn <karn@ka9q.net>  Tue, 23 Jun 2026 17:30:50 -0700
+
+ka9q-web (2026.06.10-1-trixie1) trixie; urgency=medium
+
+  * switch to date-based numbering
+  * add BUILD=debug option
+  * don't build with march=native, use 'make NATIVE=1'
+
+ -- Phil Karn <karn@ka9q.net>  Wed, 10 Jun 2026 16:54:41 -0700
+
+ka9q-web (1.0.5~trixie1) trixie; urgency=medium
+
+  * Merge wayne's upstream
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 08 Jun 2026 19:24:03 -0700
+
+ka9q-web (1.0.4~trixie1) trixie; urgency=medium
+
+  * merge wayne's upstream
+
+ -- Phil Karn <karn@ka9q.net>  Mon, 18 May 2026 20:17:48 -0700
+
+ka9q-web (1.0.3-1~trixie1) trixie; urgency=medium
+
+  * Wayne's 5/17 patches from upstream
+  * reintegrate construction of PKGDATADIR + /html
+
+ -- Phil Karn <karn@ka9q.net>  Sun, 17 May 2026 10:41:28 -0700
+
+ka9q-web (1.0.2-1~trixie1) trixie; urgency=medium
+
+  * trixie amd64
+
+ -- Phil Karn <karn@ka9q.net>  Sat, 16 May 2026 12:47:48 -0700
+
 ka9q-web (1.0.2-1~noble1) noble; urgency=medium
 
   * chage default PKGDATADIR to /usr/[local/]share/ka9q-web in misc.c borrowed from ka9q-radio

@@ -19,5 +19,3 @@ Depends:
  libonion0
 Description: Web front end for ka9q-radio
  Web server that provides a GUI front end for the ka9q-radio spectrum server.
- 
-
